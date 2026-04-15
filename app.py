@@ -288,6 +288,11 @@ def get_korean_font_properties() -> font_manager.FontProperties:
     - 설치된 폰트 탐색: Noto Sans KR / NanumGothic 등
     - 없으면 Noto Sans KR를 런타임에 다운로드(캐시) 후 사용
     """
+    # 로컬 폰트 파일 우선 확인
+    local_font = Path(__file__).parent / "fonts" / "NotoSans-Regular.ttf"
+    if local_font.exists():
+        return font_manager.FontProperties(fname=str(local_font))       
+
     # 1) Windows 기본 폰트
     if platform.system().lower().startswith("win") and os.path.exists(WINDOWS_KOREAN_FONT_PATH):
         return font_manager.FontProperties(fname=WINDOWS_KOREAN_FONT_PATH)
