@@ -5,8 +5,6 @@ from io import BytesIO
 
 import pandas as pd
 import streamlit as st
-from weasyprint import HTML
-
 
 st.set_page_config(page_title="엑셀 날짜 달력 표시기", layout="wide")
 st.title("엑셀 날짜 달력 표시기")
