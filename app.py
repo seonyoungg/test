@@ -1,27 +1,33 @@
 import calendar
-from datetime import date
+from datetime import date, datetime, time, timedelta
 import html
-from datetime import datetime, time, timedelta
 from io import BytesIO
-import os
-import tempfile
 import unicodedata
 
 import pandas as pd
-import pdfkit
 import streamlit as st
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+from reportlab.pdfgen import canvas as rl_canvas
 
 
-st.set_page_config(page_title="엑셀 날짜 달력 표시기", layout="wide")
-st.title("엑셀 날짜 달력 표시기")
-st.caption("엑셀/CSV에 입력된 날짜를 읽어 달력에 표시합니다.")
+# ── 공통 디자인 상수 ──────────────────────────────────────────
+PASTEL = ["#f6c1d1", "#fde6a7", "#c7f1c9", "#b7dcff"]
+
+def hex_to_rgb01(h: str):
+    h = h.lstrip("#")
+    return tuple(int(h[i:i+2], 16) / 255 for i in (0, 2, 4))
+
+# ── ReportLab 한글 CID 폰트 등록 ──────────────────────────────
+pdfmetrics.registerFont(UnicodeCIDFont("HYGothic-Medium"))
+KR_FONT = "HYGothic-Medium"
 
 
-# ────────────────────────────────────────────────
-# 날짜/시간 파싱 유틸
-# ────────────────────────────────────────────────
-
-def _coerce_datetime_with_fallback_year(value) -> pd.Timestamp | None:
+# ────────────────────────────────────────────────────────────────
+# 날짜/시간 파싱
+# ────────────────────────────────────────────────────────────────
+def _coerce_dt(value):
     if pd.isna(value):
         return None
     ts = pd.to_datetime(value, errors="coerce")
@@ -29,14 +35,13 @@ def _coerce_datetime_with_fallback_year(value) -> pd.Timestamp | None:
         return None
     try:
         if ts.year < 1970:
-            today = date.today()
-            ts = ts.replace(year=today.year)
+            ts = ts.replace(year=date.today().year)
     except Exception:
         pass
     return ts
 
 
-def _coerce_time(value) -> time | None:
+def _coerce_time(value):
     if pd.isna(value):
         return None
     if isinstance(value, time):
@@ -48,265 +53,227 @@ def _coerce_time(value) -> time | None:
     if isinstance(value, (int, float)):
         if value < 0:
             return None
-        seconds = int(round(float(value) * 24 * 60 * 60))
-        seconds = seconds % (24 * 60 * 60)
-        return (datetime(2000, 1, 1) + timedelta(seconds=seconds)).time()
-    s = str(value).strip()
-    if not s:
-        return None
-    ts = pd.to_datetime(s, errors="coerce")
-    if not pd.isna(ts):
-        return ts.to_pydatetime().time()
-    return None
+        sec = int(round(float(value) * 86400)) % 86400
+        return (datetime(2000, 1, 1) + timedelta(seconds=sec)).time()
+    ts = pd.to_datetime(str(value).strip(), errors="coerce")
+    return None if pd.isna(ts) else ts.to_pydatetime().time()
 
 
-def parse_schedule(file, file_name: str | None = None) -> tuple[list[date], dict[date, list[str]]]:
-    if file_name and str(file_name).lower().endswith(".csv"):
-        df = pd.read_csv(file)
-    else:
-        df = pd.read_excel(file)
+def parse_schedule(file, file_name=None):
+    df = pd.read_csv(file) if (file_name or "").lower().endswith(".csv") else pd.read_excel(file)
     if df.empty:
         return [], {}
 
-    date_col = None
-    for col in df.columns:
-        if str(col).strip().lower() in {"date", "날짜", "일시", "datetime"}:
-            date_col = col
-            break
-    if date_col is None:
-        date_col = df.columns[0]
+    date_col = next(
+        (c for c in df.columns if str(c).strip().lower() in {"date","날짜","일시","datetime"}),
+        df.columns[0],
+    )
+    todo_col = next(
+        (c for c in df.columns if str(c).strip().lower() in {"메모","할일","todo","task"}),
+        None,
+    )
+    time_col = next(
+        (c for c in df.columns if str(c).strip().lower() in {"시간","time"}),
+        None,
+    )
 
-    todo_col = None
-    for col in df.columns:
-        if str(col).strip().lower() in {"메모", "할일", "todo", "task"}:
-            todo_col = col
-            break
-
-    time_col = None
-    for col in df.columns:
-        if str(col).strip().lower() in {"시간", "time"}:
-            time_col = col
-            break
-
-    parsed_dates = df[date_col].map(_coerce_datetime_with_fallback_year)
-    rows_by_date: dict[date, list[tuple[pd.Timestamp, str]]] = {}
-
-    for idx, parsed in parsed_dates.items():
+    rows_by_date = {}
+    for idx, parsed in df[date_col].map(_coerce_dt).items():
         if parsed is None:
             continue
-        schedule_dt = parsed
-        if time_col is not None:
+        sdt = parsed
+        if time_col:
             t = _coerce_time(df.at[idx, time_col])
-            if t is not None:
-                schedule_dt = pd.Timestamp.combine(parsed.date(), t)
-
-        day = schedule_dt.date()
+            if t:
+                sdt = pd.Timestamp.combine(parsed.date(), t)
+        day = sdt.date()
         rows_by_date.setdefault(day, [])
-
         text = ""
         if todo_col is not None:
-            raw_todo = df.at[idx, todo_col]
-            if not pd.isna(raw_todo):
-                text = str(raw_todo).strip()
-
+            raw = df.at[idx, todo_col]
+            if not pd.isna(raw):
+                text = str(raw).strip()
         if text:
-            lines = []
             for chunk in text.splitlines():
                 for part in chunk.split(","):
                     item = part.strip().lstrip("-").strip()
                     if item:
-                        lines.append(item)
-            for item in lines:
-                rows_by_date[day].append((schedule_dt, item))
+                        rows_by_date[day].append((sdt, item))
         else:
-            rows_by_date[day].append((schedule_dt, ""))
+            rows_by_date[day].append((sdt, ""))
 
-    todos_by_date: dict[date, list[str]] = {}
+    todos = {}
     for day, entries in rows_by_date.items():
         entries.sort(key=lambda x: x[0])
-        formatted: list[str] = []
-        for dt_value, todo in entries:
-            time_label = dt_value.strftime("%H:%M")
-            if todo:
-                formatted.append(f"{time_label} {todo}")
-            else:
-                formatted.append(time_label)
-        todos_by_date[day] = formatted
-
-    return sorted(todos_by_date.keys()), todos_by_date
+        todos[day] = [f"{dt.strftime('%H:%M')} {todo}".strip() for dt, todo in entries]
+    return sorted(todos.keys()), todos
 
 
-# ────────────────────────────────────────────────
-# HTML 달력 렌더러 (웹 보기 & PDF 공용)
-# ────────────────────────────────────────────────
-
-def render_month_calendar(
-    year: int,
-    month: int,
-    todos_by_date: dict[date, list[str]],
-    for_pdf: bool = False,
-) -> str:
-    """
-    for_pdf=True  → 완전한 HTML 문서(<!DOCTYPE html>…) 반환 – wkhtmltopdf 입력용
-    for_pdf=False → <style>+<table> 스니펫 반환 – Streamlit st.markdown() 용
-    """
-    cal = calendar.Calendar(firstweekday=6)  # 일요일 시작
+# ────────────────────────────────────────────────────────────────
+# HTML 달력 렌더러 (웹 표시용)
+# ────────────────────────────────────────────────────────────────
+def render_html_calendar(year, month, todos):
+    cal = calendar.Calendar(firstweekday=6)
     weeks = cal.monthdatescalendar(year, month)
 
-    # PDF용 추가 스타일: @page 로 A4 가로 설정, 구글 폰트 불러오기
-    pdf_head = ""
-    if for_pdf:
-        pdf_head = f"""<!DOCTYPE html>
-<html lang="ko">
-<head>
-<meta charset="UTF-8">
-<style>
-  @page {{
-    size: A4 landscape;
-    margin: 12mm 14mm;
-  }}
-  body {{
-    margin: 0;
-    padding: 0;
-    font-family: 'Noto Sans KR', 'Apple SD Gothic Neo', '맑은 고딕', sans-serif;
-  }}
-  h1 {{
-    font-size: 20pt;
-    font-weight: 700;
-    margin: 0 0 6px 0;
-    color: #111;
-  }}
-</style>
-</head>
-<body>
-<h1>{year}년 {month}월</h1>
-"""
-
-    # 공용 CSS
     style = """
     <style>
-      .calendar {border-collapse: collapse; width: 100%; table-layout: fixed;}
-      .calendar th, .calendar td {
-        border: 1px solid #ddd;
-        vertical-align: top;
-        font-size: 13px;
-        padding: 4px 6px;
-        word-break: break-word;
-      }
-      .calendar th {
-        background: #f5f5f5;
-        height: 28px;
-        padding: 2px 6px;
-        font-size: 12px;
-        text-align: center;
-      }
-      .calendar td {height: 110px;}
-      .out-month {color: #bbb;}
-      .day-number {font-weight: 700; margin-bottom: 4px; font-size: 13px;}
-      .todo-list {margin: 0; padding-left: 0; list-style: none;}
-      .todo-list li {margin: 0 0 3px 0;}
-      .todo-pill {
-        display: block;
-        padding: 2px 5px;
-        border-radius: 5px;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        font-size: 11px;
-        line-height: 1.3;
-      }
-      .hl-1 {background: #f6c1d1;}
-      .hl-2 {background: #fde6a7;}
-      .hl-3 {background: #c7f1c9;}
-      .hl-4 {background: #b7dcff;}
-      .more {font-size: 11px; color: #666; margin-top: 2px;}
-    </style>
-    """
+      .cal{border-collapse:collapse;width:100%;table-layout:fixed}
+      .cal th,.cal td{border:1px solid #ddd;vertical-align:top;padding:4px 6px;word-break:break-word}
+      .cal th{background:#f5f5f5;height:28px;font-size:12px;text-align:center}
+      .cal td{height:110px;font-size:13px}
+      .out{color:#bbb}
+      .dn{font-weight:700;margin-bottom:4px;font-size:13px}
+      .tl{margin:0;padding:0;list-style:none}
+      .tl li{margin:0 0 3px}
+      .tp{display:block;padding:2px 5px;border-radius:5px;white-space:nowrap;
+          overflow:hidden;text-overflow:ellipsis;font-size:11px;line-height:1.3}
+      .h1{background:#f6c1d1}.h2{background:#fde6a7}
+      .h3{background:#c7f1c9}.h4{background:#b7dcff}
+      .more{font-size:11px;color:#666;margin-top:2px}
+    </style>"""
 
-    table = """
-    <table class="calendar">
-      <thead>
-        <tr>
-          <th>일</th><th>월</th><th>화</th><th>수</th><th>목</th><th>금</th><th>토</th>
-        </tr>
-      </thead>
-      <tbody>
-    """
-
+    rows = ""
     for week in weeks:
-        table += "<tr>"
+        rows += "<tr>"
         for d in week:
-            classes = []
-            if d.month != month:
-                classes.append("out-month")
-            class_attr = f' class="{" ".join(classes)}"' if classes else ""
-
-            todos = todos_by_date.get(d, [])
-            items_html = ""
-            if todos:
-                shown = todos[:4]
-                list_items = "".join(
-                    f'<li><span class="todo-pill hl-{(i % 4) + 1}">{html.escape(todo)}</span></li>'
-                    for i, todo in enumerate(shown)
+            cls = ' class="out"' if d.month != month else ""
+            items = todos.get(d, [])
+            inner = ""
+            if items:
+                shown = items[:4]
+                lis = "".join(
+                    f'<li><span class="tp h{i%4+1}">{html.escape(t)}</span></li>'
+                    for i, t in enumerate(shown)
                 )
-                more_html = (
-                    f'<div class="more">+{len(todos) - len(shown)}개 더</div>'
-                    if len(todos) > len(shown)
-                    else ""
-                )
-                items_html = f'<ul class="todo-list">{list_items}</ul>{more_html}'
+                more = f'<div class="more">+{len(items)-len(shown)}개 더</div>' if len(items) > len(shown) else ""
+                inner = f'<ul class="tl">{lis}</ul>{more}'
+            rows += f'<td{cls}><div class="dn">{d.day}</div>{inner}</td>'
+        rows += "</tr>"
 
-            table += (
-                f'<td{class_attr}>'
-                f'<div class="day-number">{d.day}</div>'
-                f'{items_html}'
-                f'</td>'
-            )
-        table += "</tr>"
-
-    table += "</tbody></table>"
-
-    if for_pdf:
-        return pdf_head + style + table + "</body></html>"
-    else:
-        return style + table
+    return f"""{style}
+    <table class="cal">
+      <thead><tr>
+        <th>일</th><th>월</th><th>화</th><th>수</th><th>목</th><th>금</th><th>토</th>
+      </tr></thead>
+      <tbody>{rows}</tbody>
+    </table>"""
 
 
-# ────────────────────────────────────────────────
-# HTML → PDF 변환 (wkhtmltopdf via pdfkit)
-# ────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────
+# ReportLab PDF 달력 (웹과 동일한 색상·구조)
+# ────────────────────────────────────────────────────────────────
+def render_pdf_calendar(year, month, todos):
+    cal = calendar.Calendar(firstweekday=6)
+    weeks = cal.monthdatescalendar(year, month)
 
-def html_to_pdf(html_str: str) -> bytes:
-    """
-    완전한 HTML 문서를 받아 A4 가로 PDF bytes로 반환.
-    @page CSS에서 페이지 크기/여백을 지정하므로 pdfkit 옵션은 최소화.
-    """
-    options = {
-        "enable-local-file-access": "",
-        "encoding": "UTF-8",
-        "quiet": "",
-        # wkhtmltopdf가 @page CSS를 존중하도록
-        "page-size": "A4",
-        "orientation": "Landscape",
-        "margin-top": "0mm",
-        "margin-right": "0mm",
-        "margin-bottom": "0mm",
-        "margin-left": "0mm",
-        "no-outline": "",
-    }
-    with tempfile.NamedTemporaryFile(suffix=".html", delete=False, mode="w", encoding="utf-8") as f:
-        f.write(html_str)
-        tmp_path = f.name
-    try:
-        pdf_bytes = pdfkit.from_file(tmp_path, False, options=options)
-    finally:
-        os.unlink(tmp_path)
-    return pdf_bytes
+    PAGE_W, PAGE_H = landscape(A4)
+    PAD    = 20
+    TITLE  = 28
+    HDR_H  = 18
+    COLS   = 7
+
+    grid_x = PAD
+    grid_w = PAGE_W - PAD * 2
+    cell_w = grid_w / COLS
+
+    # 헤더·제목 제외한 셀 영역
+    cell_area_h = PAGE_H - PAD * 2 - TITLE - 6 - HDR_H
+    cell_h = cell_area_h / len(weeks)
+
+    # y 좌표: reportlab은 아래→위 방향
+    title_y    = PAGE_H - PAD - TITLE + 4
+    hdr_top_y  = title_y - 10          # 제목 아래 여백
+    grid_top_y = hdr_top_y - HDR_H    # 헤더 아래 = 첫 번째 셀 top
+
+    PILL_H   = 13.0
+    PILL_GAP = 2.0
+    FONT_S   = 8.5
+    FONT_DAY = 10
+    FONT_TTL = 16
+    FONT_HDR = 10
+
+    buf = BytesIO()
+    c = rl_canvas.Canvas(buf, pagesize=landscape(A4))
+    c.setTitle(f"{year}년 {month}월 달력")
+
+    # ── 제목 ──────────────────────────────────────────────────
+    c.setFont(KR_FONT, FONT_TTL)
+    c.setFillColorRGB(0.07, 0.07, 0.07)
+    c.drawString(grid_x, title_y, f"{year}년 {month}월")
+
+    # ── 요일 헤더 ─────────────────────────────────────────────
+    weekdays = ["일", "월", "화", "수", "목", "금", "토"]
+    c.setFont(KR_FONT, FONT_HDR)
+    for i, name in enumerate(weekdays):
+        x = grid_x + i * cell_w
+        y = hdr_top_y - HDR_H
+        c.setFillColorRGB(0.96, 0.96, 0.96)
+        c.rect(x, y, cell_w, HDR_H, fill=1, stroke=0)
+        c.setStrokeColorRGB(0.87, 0.87, 0.87)
+        c.setLineWidth(0.5)
+        c.rect(x, y, cell_w, HDR_H, fill=0, stroke=1)
+        c.setFillColorRGB(0.13, 0.13, 0.13)
+        c.drawCentredString(x + cell_w / 2, y + HDR_H * 0.25, name)
+
+    # ── 날짜 셀 ───────────────────────────────────────────────
+    for r, week in enumerate(weeks):
+        for col, d in enumerate(week):
+            cx = grid_x + col * cell_w
+            cy = grid_top_y - (r + 1) * cell_h   # 셀 bottom-left y
+
+            in_month = d.month == month
+
+            # 셀 배경 + 테두리
+            c.setFillColorRGB(1, 1, 1)
+            c.setStrokeColorRGB(0.87, 0.87, 0.87)
+            c.setLineWidth(0.5)
+            c.rect(cx, cy, cell_w, cell_h, fill=1, stroke=1)
+
+            # 날짜 숫자
+            c.setFont(KR_FONT, FONT_DAY)
+            c.setFillColorRGB(*((.07, .07, .07) if in_month else (.74, .74, .74)))
+            c.drawString(cx + 4, cy + cell_h - FONT_DAY - 3, str(d.day))
+
+            # 일정 pills
+            items = todos.get(d, [])
+            if not items:
+                continue
+
+            inner_top = cy + cell_h - FONT_DAY - 9
+            inner_bot = cy + 4
+            avail_h   = inner_top - inner_bot
+            max_show  = min(4, max(1, int(avail_h / (PILL_H + PILL_GAP))))
+            shown     = items[:max_show]
+
+            for i, txt in enumerate(shown):
+                py     = inner_top - i * (PILL_H + PILL_GAP) - PILL_H
+                pill_w = cell_w - 8
+                r_, g_, b_ = hex_to_rgb01(PASTEL[i % 4])
+                c.setFillColorRGB(r_, g_, b_)
+                c.roundRect(cx + 4, py, pill_w, PILL_H, 3, fill=1, stroke=0)
+                c.setFillColorRGB(0.07, 0.07, 0.07)
+                c.setFont(KR_FONT, FONT_S)
+                max_chars = max(4, int(pill_w / (FONT_S * 0.58)))
+                display   = txt if len(txt) <= max_chars else txt[:max_chars - 1] + "…"
+                c.drawString(cx + 7, py + PILL_H * 0.2, display)
+
+            if len(items) > len(shown):
+                c.setFont(KR_FONT, 7.5)
+                c.setFillColorRGB(0.4, 0.4, 0.4)
+                c.drawString(cx + 4, cy + 2, f"+{len(items)-len(shown)}개 더")
+
+    c.showPage()
+    c.save()
+    return buf.getvalue()
 
 
-# ────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────
 # Streamlit UI
-# ────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────
+st.set_page_config(page_title="엑셀 날짜 달력 표시기", layout="wide")
+st.title("엑셀 날짜 달력 표시기")
+st.caption("엑셀/CSV에 입력된 날짜를 읽어 달력에 표시합니다.")
 
 uploaded_file = st.file_uploader(
     "엑셀/CSV 파일 업로드 (.xlsx, .xls, .csv)", type=["xlsx", "xls", "csv"]
@@ -331,32 +298,28 @@ if not dates:
     st.warning("유효한 날짜를 찾지 못했습니다. 날짜 형식(예: 2026-04-15)을 확인해 주세요.")
     st.stop()
 
-month_options = sorted({(d.year, d.month) for d in dates})
-option_labels = [f"{y}년 {m}월" for y, m in month_options]
+month_options  = sorted({(d.year, d.month) for d in dates})
+option_labels  = [f"{y}년 {m}월" for y, m in month_options]
 selected_label = st.selectbox("표시할 월 선택", option_labels, index=0)
-selected_idx = option_labels.index(selected_label)
-selected_year, selected_month = month_options[selected_idx]
+sel_year, sel_month = month_options[option_labels.index(selected_label)]
 
-# ── 웹 달력 표시 ──
+# 웹 달력 표시
 st.markdown(
-    render_month_calendar(selected_year, selected_month, todos_by_date, for_pdf=False),
+    render_html_calendar(sel_year, sel_month, todos_by_date),
     unsafe_allow_html=True,
 )
 
-# ── PDF 다운로드 ──
-with st.spinner("PDF 생성 중…"):
-    pdf_html = render_month_calendar(selected_year, selected_month, todos_by_date, for_pdf=True)
-    pdf_bytes = html_to_pdf(pdf_html)
-
+# PDF 다운로드 버튼
+pdf_bytes = render_pdf_calendar(sel_year, sel_month, todos_by_date)
 st.download_button(
     label="📄 PDF 다운로드 (A4 가로)",
     data=pdf_bytes,
-    file_name=f"calendar_{selected_year}_{selected_month:02d}_A4_landscape.pdf",
+    file_name=f"calendar_{sel_year}_{sel_month:02d}_A4_landscape.pdf",
     mime="application/pdf",
 )
 
 st.write(f"총 날짜 개수: **{len(dates)}개**")
 st.write(
     f"선택 월 표시 날짜: "
-    f"**{len([d for d in dates if d.year == selected_year and d.month == selected_month])}개**"
+    f"**{len([d for d in dates if d.year == sel_year and d.month == sel_month])}개**"
 )
