@@ -70,10 +70,7 @@ def parse_schedule_df(df, date_col, todo_col=None, time_col=None):
     todos = {}
     for day, entries in rows_by_date.items():
         entries.sort(key=lambda x: x[0])
-        todos[day] = [
-            f"{dt.strftime('%H:%M')} {todo}".strip()
-            for dt, todo in entries
-        ]
+        todos[day] = entries
 
     return sorted(todos.keys()), todos
 
@@ -117,14 +114,15 @@ def render_html_calendar(year, month, todos):
         for d in week:
             cls = ' class="out"' if d.month != month else ""
             items = todos.get(d, [])
+            items = sorted(items, key=lambda x: x[0])  # ⭐ 추가
 
             inner = ""
             if items:
                 shown = items[:4]
 
                 lis = "".join(
-                    f'<li><span class="tp h{i%4+1}">{html.escape(t)}</span></li>'
-                    for i, t in enumerate(shown)
+                    f'<li><span class="tp h{i%4+1}">{html.escape(dt.strftime("%H:%M") + " " + text)}</span></li>'
+                    for i, (dt, text) in enumerate(shown)
                 )
 
                 more = (
@@ -227,14 +225,14 @@ def render_pdf_calendar(year, month, todos):
             c.drawString(cx + 4, cy + cell_h - 14, str(d.day))
 
             # 일정
-            items = todos.get(d, [])
+            items = sorted(todos.get(d, []), key=lambda x: x[0])
             if not items:
                 continue
 
             max_show = 4
             shown = items[:max_show]
 
-            for i, txt in enumerate(shown):
+            for i, (dt, txt) in enumerate(shown):
                 py = cy + cell_h - 28 - i * 16
 
                 r_, g_, b_ = hex_to_rgb01(PASTEL[i % 4])
@@ -248,8 +246,13 @@ def render_pdf_calendar(year, month, todos):
                 c.setFont(KR_FONT, 8)
 
                 max_chars = int((cell_w - 10) / 5)
-                display = txt if len(txt) <= max_chars else txt[:max_chars-1] + "…"
+                display_text = dt.strftime("%H:%M") + " " + txt
 
+                display = (
+                    display_text
+                    if len(display_text) <= max_chars
+                    else display_text[:max_chars-1] + "…"
+                )
                 c.drawString(cx + 6, py + 3, display)
 
             # +N개 더
