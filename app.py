@@ -5,6 +5,8 @@ from io import BytesIO
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
+
 from reportlab.lib.pagesizes import A4, landscape
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
@@ -310,9 +312,10 @@ if all_dates:
     selected = st.selectbox("월 선택", labels)
     y, m = month_options[labels.index(selected)]
 
-    st.markdown(
-        render_html_calendar(y, m, st.session_state.all_todos),
-        unsafe_allow_html=True,
+    components.html(
+    render_html_calendar(y, m, st.session_state.all_todos),
+    height=800,
+    scrolling=True
     )
 
     pdf_bytes = render_pdf_calendar(y, m, st.session_state.all_todos)
